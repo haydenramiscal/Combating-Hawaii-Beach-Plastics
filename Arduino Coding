@@ -1,0 +1,217 @@
+#include <PID_v1.h>
+#include <thermistor.h>                     // https://github.com/miguel5612/Arduino-ThermistorLibrary
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+
+#define SCREEN_WIDTH 128                    // OLED display width, in pixels
+#define SCREEN_HEIGHT 64                    // OLED display height, in pixels
+#define OLED_RESET     -1                   // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C                 // 0x3D for 128x64, 0x3C for 128x32
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define initialTemp 220                     // Define parameters for adjustable settings
+#define minTemp 190                      
+#define maxTemp 250
+#define initialSpeed 22
+#define minSpeed 1
+#define maxSpeed 28
+#define initialMot 1
+#define minMot 0
+#define maxMot 2
+
+int encLowLim = minTemp;                    
+int encHighLim = maxTemp;
+int encIncrement = 1;
+int encCurrent = initialTemp;
+int dataInputNo = 0;                        // Data input tracking, 0 - temp, 1 - speed, 2 - motor
+
+static int pinA = 2;                        // Hardware interrupt digital pin 2
+static int pinB = 3;                        // Hardware interrupt digital pin 3
+volatile int encoderPos = initialTemp;      // Current value corresponding to the encoder position
+volatile int prevEncoderPos = initialTemp;
+
+byte oldButtonState = HIGH;                 // Button state is initially open due to pull-up resistor
+const unsigned long debounceTime = 10;      // Debounce delay time
+unsigned long buttonPressTime;              
+boolean pressed = false;
+
+const int temperaturePin = A2;              // Define IO pins for motor, pushbutton & thermistor
+const int pwmPin = 9;
+const int enablePin = 5;
+const int motDirPin = 6;
+const int motStepPin = 7;
+const int encButton = 4;
+
+int loopTime = 500;                         
+unsigned long currentTime = 0;
+
+double Kp = 80.0;                            // PID constants
+double Ki = 35.0;
+double Kd = 80.0;
+
+thermistor therm1(temperaturePin, 0);         // Thermistor connected on A2
+
+double setpoint = initialTemp;               
+double input, output;
+PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+
+int motSpeed = initialSpeed;                 
+int motDir = initialMot;
+int motMaxDelay = 100;
+int motDelayTime = 500;
+
+void setup() {
+  Serial.begin(9600);  // Initialize serial communication
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); // Don't proceed, loop forever
+  }
+
+  display.clearDisplay();  
+  pinMode(pwmPin, OUTPUT);                               
+  pid.SetMode(AUTOMATIC); 
+  pid.SetOutputLimits(0, 255);
+  input = therm1.analog2temp();                          
+  
+  pinMode(pinA, INPUT_PULLUP);                            
+  pinMode(pinB, INPUT_PULLUP);                            
+  attachInterrupt(digitalPinToInterrupt(pinA), rotaryInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinB), rotaryInterrupt, CHANGE);
+  
+  pinMode(encButton, INPUT_PULLUP);                       
+  pinMode(enablePin, OUTPUT);                             
+  pinMode(motDirPin, OUTPUT);                             
+  pinMode(motStepPin, OUTPUT);
+  digitalWrite(motDirPin, HIGH);                          // Set the initial direction for the motor
+  digitalWrite(enablePin, LOW);                           // Enable motor driver
+
+  Serial.println("Setup complete");                       
+}
+
+void loop() {
+  currentTime = millis();  // Record loop start time
+  input = therm1.analog2temp();  // Read the temperature
+  pid.Compute();                 // Compute PID output
+  analogWrite(pwmPin, output);   // Update PWM output
+
+  Serial.print("Temperature: ");
+  Serial.print(input);
+  Serial.print(" \u00B0C");
+  Serial.print("\tPWM Output: ");
+  Serial.print(output); 
+  Serial.print("\tEncoder: ");
+  Serial.println(encCurrent);
+
+  updateDataDisplay();
+
+  byte buttonState = digitalRead(encButton);
+  if (buttonState != oldButtonState && (millis() - buttonPressTime >= debounceTime)) {
+    buttonPressTime = millis();                       
+    oldButtonState = buttonState;                      
+    if (buttonState == LOW) {
+      pressed = true;
+      Serial.println("Button Pressed");
+    } else if (pressed) {
+      pressed = false;
+      Serial.println("Button Released");
+      toggleInputParameter();
+    }
+  }
+
+  adjustParameterByEncoder();
+
+  if (motDir != 1) {
+    runMotor();
+  }
+}
+
+void rotaryInterrupt() {
+  encoderPos = digitalRead(pinA);
+  if ((prevEncoderPos == 0) && (encoderPos == 1)) {
+      if (digitalRead(pinB) == 1 && encCurrent < encHighLim)
+          encCurrent += encIncrement;
+      else if (encCurrent > encLowLim)
+          encCurrent -= encIncrement;
+  }
+  prevEncoderPos = encoderPos;
+  delay(1);
+}
+
+void updateDataDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2,10);
+  display.print(F("Current Temp: "));
+  display.setCursor(2,20);
+  display.print(F("Set Temp: "));
+  display.setCursor(2,30);
+  display.print(F("Extrude Speed: "));
+  display.setCursor(2,40);
+  display.print(F("Extrude: "));
+  display.setCursor(97,10);
+  display.print(input);
+  display.print(F("C"));
+  display.setCursor(97,20);
+  display.print(setpoint);
+  display.print(F("C"));
+  display.setCursor(97,30);
+  display.print(motSpeed);
+  display.setCursor(97,40);
+  display.print(motDir == 0 ? "Rev" : motDir == 2 ? "FWD" : "OFF");
+  display.display();
+}
+
+void runMotor() {
+  digitalWrite(enablePin, LOW); // Enable motor driver
+  digitalWrite(motDirPin, motDir == 0 ? LOW : HIGH); // Set direction
+
+  for (int i = 0; i < motSpeed; i++) {
+    digitalWrite(motStepPin, HIGH);
+    delayMicroseconds(motDelayTime);
+    digitalWrite(motStepPin, LOW);
+    delayMicroseconds(motDelayTime);
+  }
+}
+
+void toggleInputParameter() {
+  if (dataInputNo == 0) {
+    dataInputNo = 1;
+    encCurrent = motSpeed;
+    encLowLim = minSpeed;
+    encHighLim = maxSpeed;
+  } else if (dataInputNo == 1) {
+    dataInputNo = 2;
+    encCurrent = motDir;
+    encLowLim = minMot;
+    encHighLim = maxMot;
+  } else {
+    dataInputNo = 0;
+    encCurrent = setpoint;
+    encLowLim = minTemp;
+    encHighLim = maxTemp;
+  }
+}
+
+void adjustParameterByEncoder() {
+  if (dataInputNo == 0)
+    setpoint = encCurrent;
+  else if (dataInputNo == 1) {
+    motSpeed = encCurrent;
+    motDelayTime = 100 * (1 + maxSpeed - motSpeed);
+  } else
+    motDir = encCurrent;
+
+  if (motDir == 0) {
+    pinMode(enablePin, OUTPUT);  
+    digitalWrite(motDirPin, LOW);  
+  } else if (motDir == 2) { 
+    pinMode(enablePin, OUTPUT);  
+    digitalWrite(motDirPin, HIGH); 
+  } else {
+    pinMode(enablePin, INPUT);  
+  }
+}
